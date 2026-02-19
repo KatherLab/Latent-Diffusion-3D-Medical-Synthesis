@@ -1,0 +1,23 @@
+{
+    
+    "batch_size": 2,
+    "patch_size": [128, 128, 128],
+    "val_batch_size": 2,
+    "val_patch_size": null,
+    "val_sliding_window_patch_size": [128, 128, 128],
+    "lr": 2e-4,
+    "recon_loss": "l1",
+    "val_interval": 10,
+    "cache": 0.5,
+    "amp": false,
+    "n_epochs": 500,
+
+    "random_aug": true,
+    "spacing_type": "rand_zoom",
+    "spacing": null,
+    "select_channel": 0,
+
+    "model_dir": "./logs_four_datasets/vqgan_ep500_embed8/",
+    "tfevent_path": "./logs_four_datasets/vqgan_ep500_embed8"
+
+}
