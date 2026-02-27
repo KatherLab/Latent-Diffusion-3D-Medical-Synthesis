@@ -34,7 +34,8 @@ def get_inhouse_data_path():
     return train_files, val_files
 
 def get_ucsf_data_path():
-    all_dirs = sorted(glob.glob("/share/project/zhaohuxing/data/UCSF-PDGM-Filtered/*"))
+    # only for inference and external validation
+    all_dirs = sorted(glob.glob("/mnt/swarm_beta/xuewei/data/UCSF-PDGM/*"))
 
     data_dicts = []
     for each_case in all_dirs:
@@ -62,7 +63,7 @@ def get_ucsf_data_path():
 
 
 def get_gbm_data_path():
-    data_path_gbm = "/share/project/zhaohuxing/data/UPENN-GBM"
+    data_path_gbm = "/mnt/swarm_beta/xuewei/data/UPENN-GBM"
 
     data_dicts = []
     dirs = os.listdir(data_path_gbm)
@@ -84,7 +85,7 @@ def get_gbm_data_path():
 
 
 def get_egd_data():
-    data_path_egd = "/share/project/zhaohuxing/data/edg"
+    data_path_egd = "/mnt/swarm_beta/xuewei/data/EGD"
     data_dicts = []
     dirs = os.listdir(data_path_egd)
     dirs = sorted(dirs)
@@ -120,13 +121,20 @@ def list_brats24_paths(path):
     return data_dicts
 
 def get_brats24_data():
-    path_1 = "/share/project/zhaohuxing/data/brats2024/BraTS24_GLI"
+    path_1_training_data1 = "/mnt/swarm_beta/xuewei/data/BraTS2024/training_data1"
+    path_1_validation_data ='/mnt/swarm_beta/xuewei/data/BraTS2024/validation_data'
     data_dicts_1 = list_brats24_paths(path_1)
 
-    path_2 = "/share/project/zhaohuxing/data/brats2024/BraTS24_MET"
+    path_2_Training_1 = "/mnt/swarm_beta/xuewei/data/BraTS24_MET/MICCAI-BraTS2024-MET-Challenge-TrainingData_1/MICCAI-BraTS2024-MET-Challenge-Training_1"
+
+    path_2v ='/mnt/swarm_beta/xuewei/data/BraTS24_MET/MICCAI-BraTS2024-MET-Challenge-TrainingData_2'
+    path_2_f ='/mnt/swarm_beta/xuewei/data/BraTS24_MET/MICCAI-BraTS2024-MET-Challenge-TrainingData_2-fixed-cases/MICCAI-BraTS2024-MET-Challenge-TrainingData_2-fixed-cases'
+    path_2_c ='/mnt/swarm_beta/xuewei/data/BraTS24_MET/MICCAI-BraTS2024-MET-Challenge-ValidationData/MICCAI-BraTS2024-MET-Challenge-Validation'
     data_dicts_2 = list_brats24_paths(path_2)
 
-    path_3 = "/share/project/zhaohuxing/data/brats2024/BraTS-PEDs2024_Training"
+    path_3 = "/mnt/swarm_beta/xuewei/data/BraTS-PEDs2024_Training/BraTS2024-PED-Challenge-TrainingData/BraTS-PEDs2024_Training"
+    path_3_2     = "/mnt/swarm_beta/xuewei/data/BraTS-PEDs2024_Training/BraTS2024-PED-Challenge-ValidationData/BraTS_Validation_Data_backup"
+
     data_dicts_3 = list_brats24_paths(path_3)
 
     len_train = int(0.8 * len(data_dicts_1))
@@ -145,7 +153,10 @@ def get_brats24_data():
 
 
 def get_brats21_data():
-    brats21_data_path = "/share/project/zhaohuxing/data/brats2021/brats21"
+    brats21_data_path = "/mnt/swarm_beta/xuewei/data/BraTS2021/RSNA_ASNR_MICCAI_BraTS2021_TrainingData_16July2021"
+    brats21_data_path_v = "/mnt/swarm_beta/xuewei/data/BraTS2021/RSNA_ASNR_MICCAI_BraTS2021_ValidationData"
+
+
     data_dicts_brats21 = []
 
     dirs = os.listdir(brats21_data_path)
