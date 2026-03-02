@@ -146,6 +146,12 @@ def main():
         slice_max_slices=int(args.slice_max_slices),
         early_patience=int(args.early_patience),
         early_min_delta=float(args.early_min_delta),
+
+        # --- From saving intermediate nii for debugging ---
+        #dump_dir="./debug_nii",
+        #dump_first_train_batches=1,
+        #dump_first_val_batches=2,
+        #dump_every_epochs=1,
     )
 
     def forward_fn(images, batch):

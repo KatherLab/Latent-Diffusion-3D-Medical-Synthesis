@@ -15,6 +15,7 @@ from .ddp import ddp_reduce_mean, is_main_process
 from .early_stop import EarlyStopping
 from .metrics import mae3d, mse3d, psnr_from_mse, slice_metrics_2d
 
+from .debug_dump import dump_batch_niftis
 
 @dataclass
 class TrainConfig:
@@ -45,6 +46,13 @@ class TrainConfig:
     debug_first_val_batches: int = 1     # print info for first N val batches each run
     debug_check_divisible_k: int = 16    # sanity check expected divisibility (matches transforms effective_k)
 
+    # =========================
+    # NIfTI dumping (debug)
+    # =========================
+    #dump_dir: str = ""
+    #dump_first_train_batches: int = 0
+    #dump_first_val_batches: int = 1   # usually you want at least 1 val example
+    #dump_every_epochs: int = 1        # 1 = every epoch; can set 5 etc
 
 def _infer_dataset_name(batch: dict) -> str:
     for k in ("source_dataset", "dataset"):
@@ -130,6 +138,7 @@ def _validate_supervised(
     perceptual_loss_fn: Optional[torch.nn.Module],
     cfg: TrainConfig,
     show_pbar: bool,
+#epoch: int,
 ) -> tuple[dict[str, float], dict[str, dict[str, Any]]]:
     model.eval()
     sums = defaultdict(float)
@@ -163,6 +172,23 @@ def _validate_supervised(
 
         with autocast(enabled=torch.cuda.is_available()):
             pred = forward_fn(images, batch)
+            '''
+            if (
+                    cfg.dump_dir
+                    and is_main_process()
+                    and epoch % int(cfg.dump_every_epochs) == 0
+                    and bi < int(cfg.dump_first_val_batches)
+            ):
+                dump_batch_niftis(
+                    out_dir=cfg.dump_dir,
+                    tag="val",
+                    epoch=epoch,
+                    bi=bi,
+                    batch=batch,
+                    pred=pred.detach(),
+                    labels=labels.detach(),
+                )
+            '''
             if pred.shape != labels.shape:
                 raise RuntimeError(f"[VAL] pred/labels shape mismatch: pred={tuple(pred.shape)} labels={tuple(labels.shape)}")
             l1 = loss_fn(pred, labels)
@@ -287,6 +313,24 @@ def run_training_supervised(
 
             with autocast(enabled=torch.cuda.is_available()):
                 pred = forward_fn(images, batch)
+                '''
+                # after loss is computed and pred exists
+                if (
+                        cfg.dump_dir
+                        and is_main_process()
+                        and epoch % int(cfg.dump_every_epochs) == 0
+                        and bi < int(cfg.dump_first_train_batches)
+                ):
+                    dump_batch_niftis(
+                        out_dir=cfg.dump_dir,
+                        tag="train",
+                        epoch=epoch,
+                        bi=bi,
+                        batch=batch,
+                        pred=pred.detach(),
+                        labels=labels.detach(),
+                    )
+                    '''
                 if pred.shape != labels.shape:
                     raise RuntimeError(f"[TRAIN] pred/labels shape mismatch: pred={tuple(pred.shape)} labels={tuple(labels.shape)}")
                 l1 = loss_fn(pred, labels)
@@ -346,6 +390,7 @@ def run_training_supervised(
                 perceptual_loss_fn=perceptual_loss_fn,
                 cfg=cfg,
                 show_pbar=is_main_process(),
+                #epoch=epoch,
             )
 
             metrics = ddp_reduce_mean(metrics, device=device)
