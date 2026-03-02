@@ -1,21 +1,16 @@
 from __future__ import annotations
 
 """
-utils/brain_data_utils.py
+utils/brain_data_utils.py (project-patched)
 
-Changes vs original:
-- Preserves provenance keys (case_id, source_dataset, subsource) from utils/local_path.py,
-  so we can compute per-dataset metrics in validation/inference.
-- Adds a safe dict_collate for batching dicts with tensors + strings.
-- Adds optional MONAI CacheDataset / PersistentDataset for faster repeated epochs.
-- Keeps transform usage consistent with original code.
-
-Expected upstream:
-- utils/local_path.py get_data_path() returns list[dict] items with keys:
-    t1n,t1c,t2w,t2f plus metadata: case_id, source_dataset, subsource
+Changes vs your current file:
+- Validation transform output_dtype changed to float32 for metric correctness (avoid fp16 metric bias).
+- Adds optional "debug_force_val_patch_size" via env var DEBUG_VAL_PATCH_SIZE="128,128,128" to
+  force val_patch_size without changing config (quick padding sanity check).
 """
 
 from pathlib import Path
+import os
 
 import torch
 from torch.utils.data import Dataset
@@ -55,7 +50,27 @@ def dict_collate(batch):
     return out
 
 
+def _maybe_force_val_patch_size(args):
+    """
+    Allow forcing val patch size via env var for quick "are metrics fooled by padding?" check.
+    Example:
+      export DEBUG_VAL_PATCH_SIZE=128,128,128
+    """
+    s = os.environ.get("DEBUG_VAL_PATCH_SIZE", "").strip()
+    if not s:
+        return
+    try:
+        parts = [int(x) for x in s.replace(" ", "").split(",") if x]
+        if len(parts) == 3:
+            args.val_patch_size = parts
+            print(f"[DEBUG] Forced args.val_patch_size={args.val_patch_size} via DEBUG_VAL_PATCH_SIZE")
+    except Exception:
+        print(f"[DEBUG] Failed to parse DEBUG_VAL_PATCH_SIZE='{s}', ignoring.")
+
+
 def get_transforms(args):
+    _maybe_force_val_patch_size(args)
+
     # Preserve these keys through the transform pipeline.
     additional_keys = ["case_id", "source_dataset", "subsource"]
 
@@ -74,12 +89,16 @@ def get_transforms(args):
         select_channel=0,
     )
 
+    # IMPORTANT: output_dtype float32 for accurate validation metrics.
     val_transform = VAETransformMRI(
         is_train=False,
         random_aug=False,
         k=4,
+        patch_size=args.patch_size,
         val_patch_size=args.val_patch_size,
-        output_dtype=torch.float16,
+        output_dtype=torch.float32,
+        spacing_type=getattr(args, "spacing_type", "rand_zoom"),
+        spacing=getattr(args, "spacing", None),
         image_keys=["t1c", "t1n", "t2f", "t2w"],
         label_keys=[],
         additional_keys=additional_keys,

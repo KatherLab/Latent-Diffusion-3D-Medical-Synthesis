@@ -9,6 +9,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+utils/transforms.py (project-patched)
+
+What changed vs your current file:
+1) Percentile intensity scaling performance:
+   - Adds Lambdad(..., x.contiguous()) before ScaleIntensityRangePercentilesd (MRI).
+2) Validation legitimacy / padding debug:
+   - For validation pipelines, we keep MONAI metadata (track_meta=True) so you can inspect
+     original spatial shape vs post-pad/crop shape.
+   - We store orig spatial shape in meta under key "orig_spatial_shape" right after EnsureChannelFirstd
+     (before any pad/crop), so you can later compare.
+3) Training stability:
+   - Training still uses track_meta=False by default (plain torch.Tensor) to avoid MetaTensor
+     propagation into pure torch ops.
+"""
+
+from __future__ import annotations
+
+import os
 import warnings
 from typing import List, Optional
 
@@ -39,10 +58,25 @@ from monai.transforms import (
     Spacingd,
     SpatialPadd,
 )
-# from monai.transforms.intensity.dictionary import ScaleIntensityMRI3D
-
 
 SUPPORT_MODALITIES = ["ct", "mri"]
+
+# Optional: set to "1" to keep meta in TRAIN too (usually not needed).
+_KEEP_META_TRAIN = os.environ.get("KEEP_META_TRAIN", "0").strip() == "1"
+
+
+def _mark_orig_shape(x):
+    """
+    Save the pre-pad/crop spatial shape into MetaTensor.meta['orig_spatial_shape'] when possible.
+    x is expected to be channel-first: [C, D, H, W] (3D) or [C, H, W] (2D).
+    """
+    try:
+        if hasattr(x, "meta") and isinstance(x.meta, dict):
+            # spatial dims are everything after channel
+            x.meta["orig_spatial_shape"] = tuple(int(s) for s in x.shape[1:])
+    except Exception:
+        pass
+    return x
 
 
 def define_fixed_intensity_transform(modality: str, image_keys: List[str] = ["image"]) -> List:
@@ -58,53 +92,49 @@ def define_fixed_intensity_transform(modality: str, image_keys: List[str] = ["im
     """
     if modality not in SUPPORT_MODALITIES:
         warnings.warn(
-            f"Intensity transform only support {SUPPORT_MODALITIES}. Got {modality}. Will not do any intensity transform and will use original intensities."
+            f"Intensity transform only support {SUPPORT_MODALITIES}. Got {modality}. "
+            f"Will not do any intensity transform and will use original intensities."
         )
 
-    modality = modality.lower()  # Normalize modality to lowercase
+    modality = modality.lower()
 
     intensity_transforms = {
         "mri": [
+            # Avoid non-contiguous warning / extra copy inside torch.searchsorted.
             Lambdad(keys=image_keys, func=lambda x: x.contiguous()),
-            ScaleIntensityRangePercentilesd(keys=image_keys, lower=0.0, upper=99.5, b_min=0.0, b_max=1, clip=False),
+            ScaleIntensityRangePercentilesd(
+                keys=image_keys, lower=0.0, upper=99.5, b_min=0.0, b_max=1.0, clip=False
+            ),
         ],
-        "ct": [ScaleIntensityRanged(keys=image_keys, a_min=-1000, a_max=1000, b_min=0.0, b_max=1.0, clip=True)],
+        "ct": [
+            ScaleIntensityRanged(keys=image_keys, a_min=-1000, a_max=1000, b_min=0.0, b_max=1.0, clip=True)
+        ],
     }
 
-    if modality not in intensity_transforms:
-        return []
-
-    return intensity_transforms[modality]
+    return intensity_transforms.get(modality, [])
 
 
 def define_random_intensity_transform(modality: str, image_keys: List[str] = ["image"]) -> List:
     """
     Define random intensity transform based on the modality.
-
-    Args:
-        modality (str): The imaging modality, either 'ct' or 'mri'.
-        image_keys (List[str], optional): List of image keys. Defaults to ["image"].
-
-    Returns:
-        List: A list of random intensity transforms.
     """
-    modality = modality.lower()  # Normalize modality to lowercase
+    modality = modality.lower()
     if modality not in SUPPORT_MODALITIES:
         warnings.warn(
-            f"Intensity transform only support {SUPPORT_MODALITIES}. Got {modality}. Will not do any intensity transform and will use original intensities."
+            f"Intensity transform only support {SUPPORT_MODALITIES}. Got {modality}. "
+            f"Will not do any intensity transform and will use original intensities."
         )
 
     if modality == "ct":
-        return []  # CT HU intensity is stable across different datasets
-    elif modality == "mri":
+        return []
+    if modality == "mri":
         return [
             RandBiasFieldd(keys=image_keys, prob=0.3, coeff_range=(0.0, 0.3)),
             RandGibbsNoised(keys=image_keys, prob=0.3, alpha=(0.5, 1.0)),
             RandAdjustContrastd(keys=image_keys, prob=0.3, gamma=(0.5, 2.0)),
             RandHistogramShiftd(keys=image_keys, prob=0.05, num_control_points=10),
         ]
-    else:
-        return []
+    return []
 
 
 def define_vae_transform(
@@ -121,24 +151,16 @@ def define_vae_transform(
     label_keys: List[str] = [],
     additional_keys: List[str] = [],
     select_channel: int = 0,
-) -> tuple:
-    """
-    Define the MAISI VAE transform pipeline for training or validation.
-
-    Notes (project-specific):
-    - We set EnsureTyped(..., track_meta=False) to convert MONAI MetaTensor -> plain torch.Tensor.
-      This avoids rare shape/metadata propagation issues when using pure torch ops inside networks.
-    - We enforce a minimum divisible padding factor in validation (effective_k >= 16) because many 3D UNets
-      downsample 4 times (2^4 = 16). If your UNet downsamples 5 times, you may prefer k=32.
-    """
-    modality = modality.lower()  # Normalize modality to lowercase
+) -> Compose:
+    modality = modality.lower()
     if modality not in SUPPORT_MODALITIES:
         warnings.warn(
-            f"Intensity transform only support {SUPPORT_MODALITIES}. Got {modality}. Will not do any intensity transform and will use original intensities."
+            f"Intensity transform only support {SUPPORT_MODALITIES}. Got {modality}. "
+            f"Will not do any intensity transform and will use original intensities."
         )
 
     if spacing_type not in ["original", "fixed", "rand_zoom"]:
-        raise ValueError(f"spacing_type has to be chosen from ['original', 'fixed', 'rand_zoom']. Got {spacing_type}.")
+        raise ValueError(f"spacing_type must be in ['original','fixed','rand_zoom'], got {spacing_type}.")
 
     keys = image_keys + label_keys + additional_keys
     interp_mode = ["bilinear"] * len(image_keys) + ["nearest"] * len(label_keys)
@@ -150,8 +172,9 @@ def define_vae_transform(
         Orientationd(keys=keys, axcodes="RAS", allow_missing_keys=True),
     ]
 
-    # if modality == "mri":
-    #     common_transform.append(Lambdad(keys=image_keys, func=lambda x: x[select_channel : select_channel + 1, ...]))
+    # Mark original spatial shape BEFORE any padding/cropping.
+    # Only meaningful if meta is kept (validation by default).
+    common_transform.append(Lambdad(keys=image_keys, func=_mark_orig_shape, allow_missing_keys=True))
 
     common_transform.extend(define_fixed_intensity_transform(modality, image_keys=image_keys))
 
@@ -174,7 +197,6 @@ def define_vae_transform(
                 RandShiftIntensityd(keys=image_keys, allow_missing_keys=True, prob=0.3, offsets=0.05),
             ]
         )
-
         if spacing_type == "rand_zoom":
             random_transform.extend(
                 [
@@ -201,34 +223,23 @@ def define_vae_transform(
             )
 
     if is_train:
-        train_crop = [
+        crop = [
             SpatialPadd(keys=keys, spatial_size=patch_size, allow_missing_keys=True),
-            RandSpatialCropd(
-                keys=keys, roi_size=patch_size, allow_missing_keys=True, random_size=False, random_center=True
-            ),
+            RandSpatialCropd(keys=keys, roi_size=patch_size, allow_missing_keys=True, random_size=False, random_center=True),
         ]
     else:
-        # Ensure val spatial dims are compatible with deep UNets (avoid 40 vs 39 skip mismatch).
         effective_k = max(int(k), 16)
-        val_crop = (
+        crop = (
             [DivisiblePadd(keys=keys, allow_missing_keys=True, k=effective_k)]
             if val_patch_size is None
             else [ResizeWithPadOrCropd(keys=keys, allow_missing_keys=True, spatial_size=val_patch_size)]
         )
 
-    # NOTE: track_meta=False is intentional (see docstring notes above).
-    final_transform = [EnsureTyped(keys=keys, dtype=output_dtype, allow_missing_keys=True, track_meta=False)]
+    # Train: default to plain Tensor. Val: keep meta so you can inspect orig vs padded shapes.
+    track_meta = (not is_train) or _KEEP_META_TRAIN
+    final = [EnsureTyped(keys=keys, dtype=output_dtype, allow_missing_keys=True, track_meta=track_meta)]
 
-    if is_train:
-        train_transforms = Compose(
-            common_transform + random_transform + train_crop + final_transform
-            if random_aug
-            else common_transform + train_crop + final_transform
-        )
-        return train_transforms
-    else:
-        val_transforms = Compose(common_transform + val_crop + final_transform)
-        return val_transforms
+    return Compose(common_transform + (random_transform if (is_train and random_aug) else []) + crop + final)
 
 
 def define_vae_transform_mri3d(
@@ -245,24 +256,17 @@ def define_vae_transform_mri3d(
     label_keys: List[str] = [],
     additional_keys: List[str] = [],
     select_channel: int = 0,
-) -> tuple:
-    """
-    Define the MAISI VAE transform pipeline for training or validation.
-
-    IMPORTANT FIX:
-    - Previously, validation returned Compose(common_transform + final_transform) with NO crop/pad,
-      which can cause UNet skip-connection size mismatch (e.g., 40 vs 39) on odd-sized volumes.
-    - We restore validation padding/cropping using DivisiblePadd (effective_k >= 16 by default).
-    - We set EnsureTyped(track_meta=False) to avoid MetaTensor participating in torch ops.
-    """
-    modality = modality.lower()  # Normalize modality to lowercase
+) -> Compose:
+    # This path is the one you actually use (VAETransformMRI), so keep it aligned with define_vae_transform().
+    modality = modality.lower()
     if modality not in SUPPORT_MODALITIES:
         warnings.warn(
-            f"Intensity transform only support {SUPPORT_MODALITIES}. Got {modality}. Will not do any intensity transform and will use original intensities."
+            f"Intensity transform only support {SUPPORT_MODALITIES}. Got {modality}. "
+            f"Will not do any intensity transform and will use original intensities."
         )
 
     if spacing_type not in ["original", "fixed", "rand_zoom"]:
-        raise ValueError(f"spacing_type has to be chosen from ['original', 'fixed', 'rand_zoom']. Got {spacing_type}.")
+        raise ValueError(f"spacing_type must be in ['original','fixed','rand_zoom'], got {spacing_type}.")
 
     keys = image_keys + label_keys + additional_keys
     interp_mode = ["bilinear"] * len(image_keys) + ["nearest"] * len(label_keys)
@@ -271,27 +275,17 @@ def define_vae_transform_mri3d(
         SelectItemsd(keys=keys, allow_missing_keys=True),
         LoadImaged(keys=keys, allow_missing_keys=True),
         EnsureChannelFirstd(keys=keys, allow_missing_keys=True),
-        # Orientationd(keys=keys, axcodes="RAS", allow_missing_keys=True),
+        # Orientation intentionally off here (project choice)
     ]
-    common_transform.append(Lambdad(keys=image_keys, func=lambda x: x.contiguous()))
-    common_transform.append(
-        ScaleIntensityRangePercentilesd(
-            keys=image_keys,
-            lower=0.0,
-            upper=99.5,
-            b_min=0.0,
-            b_max=1,
-            clip=False,
-        )
-    )
-    # common_transform.append(ScaleIntensityMRI3D(keys=image_keys, lower=0.0, upper=99.5, b_min=0.0, b_max=1, clip=False))
-    # common_transform.append(EnsureChannelFirstd(keys=keys, allow_missing_keys=True))
-    # common_transform.append(Orientationd(keys=keys, axcodes="RAS", allow_missing_keys=True))
 
-    # if spacing_type == "fixed":
-    #     common_transform.append(
-    #         Spacingd(keys=image_keys + label_keys, allow_missing_keys=True, pixdim=spacing, mode=interp_mode)
-    #     )
+    # Mark original shape (for validation debug)
+    common_transform.append(Lambdad(keys=image_keys, func=_mark_orig_shape, allow_missing_keys=True))
+
+    # Intensity (MRI fixed)
+    common_transform.append(Lambdad(keys=image_keys, func=lambda x: x.contiguous(), allow_missing_keys=True))
+    common_transform.append(
+        ScaleIntensityRangePercentilesd(keys=image_keys, lower=0.0, upper=99.5, b_min=0.0, b_max=1.0, clip=False)
+    )
 
     random_transform = []
     if is_train and random_aug:
@@ -307,7 +301,6 @@ def define_vae_transform_mri3d(
                 RandShiftIntensityd(keys=image_keys, allow_missing_keys=True, prob=0.3, offsets=0.05),
             ]
         )
-
         if spacing_type == "rand_zoom":
             random_transform.extend(
                 [
@@ -334,34 +327,22 @@ def define_vae_transform_mri3d(
             )
 
     if is_train:
-        train_crop = [
+        crop = [
             SpatialPadd(keys=keys, spatial_size=patch_size, allow_missing_keys=True),
-            RandSpatialCropd(
-                keys=keys, roi_size=patch_size, allow_missing_keys=True, random_size=False, random_center=True
-            ),
+            RandSpatialCropd(keys=keys, roi_size=patch_size, allow_missing_keys=True, random_size=False, random_center=True),
         ]
     else:
-        # Validation: either pad to divisible shape (default) or crop/pad to fixed patch size.
         effective_k = max(int(k), 16)
-        val_crop = (
+        crop = (
             [DivisiblePadd(keys=keys, allow_missing_keys=True, k=effective_k)]
             if val_patch_size is None
             else [ResizeWithPadOrCropd(keys=keys, allow_missing_keys=True, spatial_size=val_patch_size)]
         )
 
-    # NOTE: track_meta=False is intentional.
-    final_transform = [EnsureTyped(keys=keys, dtype=output_dtype, allow_missing_keys=True, track_meta=False)]
+    track_meta = (not is_train) or _KEEP_META_TRAIN
+    final = [EnsureTyped(keys=keys, dtype=output_dtype, allow_missing_keys=True, track_meta=track_meta)]
 
-    if is_train:
-        train_transforms = Compose(
-            common_transform + random_transform + train_crop + final_transform
-            if random_aug
-            else common_transform + train_crop + final_transform
-        )
-        return train_transforms
-    else:
-        val_transforms = Compose(common_transform + val_crop + final_transform)
-        return val_transforms
+    return Compose(common_transform + (random_transform if (is_train and random_aug) else []) + crop + final)
 
 
 def define_vae_transform2d(
@@ -378,22 +359,17 @@ def define_vae_transform2d(
     label_keys: List[str] = [],
     additional_keys: List[str] = [],
     select_channel: int = 0,
-) -> tuple:
-    """
-    Define the MAISI VAE transform pipeline for training or validation.
-
-    Notes:
-    - track_meta=False for EnsureTyped to return plain torch.Tensor.
-    - effective_k >= 16 for divisible padding (if val_patch_size is None).
-    """
-    modality = modality.lower()  # Normalize modality to lowercase
+) -> Compose:
+    # Keep consistent with define_vae_transform, just without random 3D cropping in train (as your original).
+    modality = modality.lower()
     if modality not in SUPPORT_MODALITIES:
         warnings.warn(
-            f"Intensity transform only support {SUPPORT_MODALITIES}. Got {modality}. Will not do any intensity transform and will use original intensities."
+            f"Intensity transform only support {SUPPORT_MODALITIES}. Got {modality}. "
+            f"Will not do any intensity transform and will use original intensities."
         )
 
     if spacing_type not in ["original", "fixed", "rand_zoom"]:
-        raise ValueError(f"spacing_type has to be chosen from ['original', 'fixed', 'rand_zoom']. Got {spacing_type}.")
+        raise ValueError(f"spacing_type must be in ['original','fixed','rand_zoom'], got {spacing_type}.")
 
     keys = image_keys + label_keys + additional_keys
     interp_mode = ["bilinear"] * len(image_keys) + ["nearest"] * len(label_keys)
@@ -405,9 +381,7 @@ def define_vae_transform2d(
         Orientationd(keys=keys, axcodes="RAS", allow_missing_keys=True),
     ]
 
-    # if modality == "mri":
-    #     common_transform.append(Lambdad(keys=image_keys, func=lambda x: x[select_channel : select_channel + 1, ...]))
-
+    common_transform.append(Lambdad(keys=image_keys, func=_mark_orig_shape, allow_missing_keys=True))
     common_transform.extend(define_fixed_intensity_transform(modality, image_keys=image_keys))
 
     if spacing_type == "fixed":
@@ -429,7 +403,6 @@ def define_vae_transform2d(
                 RandShiftIntensityd(keys=image_keys, allow_missing_keys=True, prob=0.3, offsets=0.05),
             ]
         )
-
         if spacing_type == "rand_zoom":
             random_transform.extend(
                 [
@@ -456,39 +429,25 @@ def define_vae_transform2d(
             )
 
     if is_train:
-        train_crop = [
-            SpatialPadd(keys=keys, spatial_size=patch_size, allow_missing_keys=True),
-            # RandSpatialCropd(
-            #     keys=keys, roi_size=patch_size, allow_missing_keys=True, random_size=False, random_center=True
-            # ),
-        ]
+        crop = [SpatialPadd(keys=keys, spatial_size=patch_size, allow_missing_keys=True)]
     else:
         effective_k = max(int(k), 16)
-        val_crop = (
+        crop = (
             [DivisiblePadd(keys=keys, allow_missing_keys=True, k=effective_k)]
             if val_patch_size is None
             else [ResizeWithPadOrCropd(keys=keys, allow_missing_keys=True, spatial_size=val_patch_size)]
         )
 
-    final_transform = [EnsureTyped(keys=keys, dtype=output_dtype, allow_missing_keys=True, track_meta=False)]
+    track_meta = (not is_train) or _KEEP_META_TRAIN
+    final = [EnsureTyped(keys=keys, dtype=output_dtype, allow_missing_keys=True, track_meta=track_meta)]
 
-    if is_train:
-        train_transforms = Compose(
-            common_transform + random_transform + train_crop + final_transform
-            if random_aug
-            else common_transform + train_crop + final_transform
-        )
-        return train_transforms
-    else:
-        val_transforms = Compose(common_transform + val_crop + final_transform)
-        return val_transforms
+    return Compose(common_transform + (random_transform if (is_train and random_aug) else []) + crop + final)
 
 
 class VAE_Transform:
     """
     A class to handle MAISI VAE transformations for different modalities.
     """
-
     def __init__(
         self,
         is_train: bool,
@@ -504,17 +463,10 @@ class VAE_Transform:
         additional_keys: List[str] = [],
         select_channel: int = 0,
     ):
-        """
-        Initialize the VAE_Transform.
-        """
         if spacing_type not in ["original", "fixed", "rand_zoom"]:
-            raise ValueError(
-                f"spacing_type has to be chosen from ['original', 'fixed', 'rand_zoom']. Got {spacing_type}."
-            )
-
+            raise ValueError(f"spacing_type must be in ['original','fixed','rand_zoom'], got {spacing_type}.")
         self.is_train = is_train
         self.transform_dict = {}
-
         for modality in ["ct", "mri"]:
             self.transform_dict[modality] = define_vae_transform(
                 is_train=is_train,
@@ -533,25 +485,18 @@ class VAE_Transform:
             )
 
     def __call__(self, img: dict, fixed_modality: Optional[str] = None) -> dict:
-        """
-        Apply the appropriate transform to the input image.
-        """
-        modality = fixed_modality or img["class"]
-        modality = modality.lower()  # Normalize modality to lowercase
+        modality = fixed_modality or img.get("class", "mri")
+        modality = modality.lower()
         if modality not in ["ct", "mri"]:
             warnings.warn(
-                f"Intensity transform only support {SUPPORT_MODALITIES}. Got {modality}. Will not do any intensity transform and will use original intensities."
+                f"Intensity transform only support {SUPPORT_MODALITIES}. Got {modality}. "
+                f"Will not do any intensity transform and will use original intensities."
             )
-
-        transform = self.transform_dict[modality]
-        return transform(img)
+        return self.transform_dict[modality](img)
 
 
 class VAETransformMRI:
-    """
-    A class to handle MAISI VAE transformations for MRI 3D.
-    """
-
+    """MRI 3D transform wrapper (used by your brain_data_utils.py)."""
     def __init__(
         self,
         is_train: bool,
@@ -568,12 +513,7 @@ class VAETransformMRI:
         select_channel: int = 0,
     ):
         if spacing_type not in ["original", "fixed", "rand_zoom"]:
-            raise ValueError(
-                f"spacing_type has to be chosen from ['original', 'fixed', 'rand_zoom']. Got {spacing_type}."
-            )
-
-        self.is_train = is_train
-
+            raise ValueError(f"spacing_type must be in ['original','fixed','rand_zoom'], got {spacing_type}.")
         self.transform = define_vae_transform_mri3d(
             is_train=is_train,
             modality="mri",
@@ -595,10 +535,7 @@ class VAETransformMRI:
 
 
 class VAETransformMRI2D:
-    """
-    A class to handle MAISI VAE transformations for MRI 2D.
-    """
-
+    """MRI 2D transform wrapper."""
     def __init__(
         self,
         is_train: bool,
@@ -615,12 +552,7 @@ class VAETransformMRI2D:
         select_channel: int = 0,
     ):
         if spacing_type not in ["original", "fixed", "rand_zoom"]:
-            raise ValueError(
-                f"spacing_type has to be chosen from ['original', 'fixed', 'rand_zoom']. Got {spacing_type}."
-            )
-
-        self.is_train = is_train
-
+            raise ValueError(f"spacing_type must be in ['original','fixed','rand_zoom'], got {spacing_type}.")
         self.transform = define_vae_transform2d(
             is_train=is_train,
             modality="mri",
