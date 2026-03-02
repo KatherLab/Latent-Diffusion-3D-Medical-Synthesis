@@ -7,18 +7,25 @@ Unified MRI dataset loader (multi-root capable) with:
 - multi-root merge inside a single dataset (e.g., BraTS2024 = GLI + MET + PED)
 - automatic integrity validation
 - faster IO via ThreadPoolExecutor
-- deterministic split with optional stratification (default: by source_dataset)
+- deterministic split with optional stratification
 
-IMPORTANT:
-- The dataset roots below are updated to match your real paths used in local_path.py:
-  /mnt/swarm_beta/xuewei/data/...
-  (You can override via env var MRI_DATA_ROOT.)
+IMPORTANT (fix for your current MONAI crash):
+- We keep ONLY image paths at top-level keys: t1n,t1c,t2w,t2f
+- All metadata goes under a nested dict: item["meta"] = {...}
+  This prevents MONAI LoadImaged from trying to load metadata strings
+  (e.g., "UPENN-GBM-00450_11") as if they were files.
 
-This script is meant to *index* files and return train/val dicts:
-  {"t1n":..., "t1c":..., "t2w":..., "t2f":..., "case_id":..., "source_dataset":..., "subsource":...}
+This script indexes files and returns train/val dicts:
+  {
+    "t1n": "...nii(.gz)",
+    "t1c": "...nii(.gz)",
+    "t2w": "...nii(.gz)",
+    "t2f": "...nii(.gz)",
+    "meta": {"case_id":..., "source_dataset":..., "subsource":...}
+  }
 
 Usage:
-  python local_path_unified.py
+  python -m utils.local_path
 """
 
 from __future__ import annotations
@@ -30,24 +37,27 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from .try_read_all_nifty import check_nifti_corruption
 
 # -----------------------------
 # Common types / constants
 # -----------------------------
 
-ModalityMap = Dict[str, str]  # {"t1n": "...", "t1c": "...", "t2w": "...", "t2f": "...", ...metadata...}
+ModalityMap = Dict[str, str]  # t1n/t1c/t2w/t2f are file paths; meta is nested dict
 REQUIRED_MODALITIES = ("t1n", "t1c", "t2w", "t2f")
+
+# Explicit blacklist for known corrupted cases (exclude whole case)
+BLACKLIST_CASE_IDS = {
+    "BraTS-PED-00255-000",  # corrupted t1c: not a gzip file
+}
 
 
 # -----------------------------
 # Configuration (UPDATED)
 # -----------------------------
-# You previously hardcoded /mnt/swarm_beta/xuewei/data in local_path.py.
-# Keep that as default, but allow override.
+
 DATA_ROOT = os.environ.get("MRI_DATA_ROOT", "/mnt/swarm_beta/xuewei/data")
 
-# BraTS2021 (real paths from local_path.py)
+# BraTS2021
 BRATS21_TRAIN_ROOT = os.path.join(
     DATA_ROOT, "BraTS2021", "RSNA_ASNR_MICCAI_BraTS2021_TrainingData_16July2021"
 )
@@ -55,16 +65,16 @@ BRATS21_VAL_ROOT = os.path.join(
     DATA_ROOT, "BraTS2021", "RSNA_ASNR_MICCAI_BraTS2021_ValidationData"
 )
 
-# BraTS2024 GLI (real paths from local_path.py)
+# BraTS2024 GLI
 BRATS24_GLI_TRAIN_ROOT = os.path.join(DATA_ROOT, "BraTS2024", "training_data1")
 BRATS24_GLI_VAL_ROOT = os.path.join(DATA_ROOT, "BraTS2024", "validation_data")
 
-# BraTS2024 MET (real paths from local_path.py)
+# BraTS2024 MET
 BRATS24_MET_ROOT_1 = os.path.join(DATA_ROOT, "BraTS24_MET", "MICCAI-BraTS2024-MET-Challenge-TrainingData_1")
-BRATS24_MET_ROOT_2 = os.path.join(DATA_ROOT, "BraTS24_MET", "MICCAI-BraTS2024-MET-Challenge-TrainingData_2")  # fixed cases already
+BRATS24_MET_ROOT_2 = os.path.join(DATA_ROOT, "BraTS24_MET", "MICCAI-BraTS2024-MET-Challenge-TrainingData_2")
 BRATS24_MET_VAL_ROOT = os.path.join(DATA_ROOT, "BraTS24_MET", "MICCAI-BraTS2024-MET-Challenge-ValidationData")
 
-# BraTS2024 PED (real paths from local_path.py)
+# BraTS2024 PED
 BRATS24_PED_TRAIN_ROOT = os.path.join(
     DATA_ROOT, "BraTS-PEDs2024_Training", "BraTS2024-PED-Challenge-TrainingData"
 )
@@ -72,7 +82,7 @@ BRATS24_PED_VAL_ROOT = os.path.join(
     DATA_ROOT, "BraTS-PEDs2024_Training", "BraTS2024-PED-Challenge-ValidationData"
 )
 
-# EGD / UPENN / UCSF (real paths from local_path.py)
+# EGD / UPENN / UCSF
 EGD_ROOT = os.path.join(DATA_ROOT, "EGD")
 UPENN_GBM_ROOT = os.path.join(DATA_ROOT, "UPENN-GBM")
 UCSF_PDGM_ROOT = os.path.join(DATA_ROOT, "UCSF-PDGM")
@@ -100,6 +110,13 @@ def _pick_first(pattern: str) -> Optional[str]:
     hits = glob.glob(pattern)
     return hits[0] if hits else None
 
+def _pick_first_any(patterns: Iterable[str]) -> Optional[str]:
+    for pat in patterns:
+        p = _pick_first(pat)
+        if p:
+            return p
+    return None
+
 def _assert_case_integrity(case_id: str, paths: ModalityMap) -> None:
     missing = [m for m in REQUIRED_MODALITIES if m not in paths or not paths[m]]
     if missing:
@@ -120,10 +137,9 @@ def _existing_dirs(paths: Iterable[str]) -> List[str]:
             out.append(p)
     return out
 
-def _dedupe_by_modalities(items: List[ModalityMap]) -> List[ModalityMap]:
+def _dedupe_by_modalities(items: List[dict]) -> List[dict]:
     """
-    Deduplicate across merged roots (especially BraTS2024 packs) by the 4 modality absolute paths.
-    This replaces the brittle 'del train_files_brats24[1245]' logic from your old script.
+    Deduplicate by the 4 modality absolute paths.
     """
     seen = set()
     out = []
@@ -135,26 +151,40 @@ def _dedupe_by_modalities(items: List[ModalityMap]) -> List[ModalityMap]:
         out.append(it)
     return out
 
+def _get_stratify_value(item: dict, key: str) -> str:
+    """
+    Supports:
+      - "source_dataset"  -> item["meta"]["source_dataset"]
+      - "subsource"       -> item["meta"]["subsource"]
+      - "meta.case_id"    -> item["meta"]["case_id"]
+    """
+    if key.startswith("meta."):
+        subk = key.split(".", 1)[1]
+        return str(item.get("meta", {}).get(subk, "unknown"))
+    # Backwards-compat alias: allow "source_dataset"/"subsource"/"case_id"
+    if key in ("source_dataset", "subsource", "case_id"):
+        return str(item.get("meta", {}).get(key, "unknown"))
+    return str(item.get(key, "unknown"))
+
 
 # -----------------------------
 # Splitting (supports stratify)
 # -----------------------------
 
 def split_train_val(
-    items: List[ModalityMap],
+    items: List[dict],
     train_ratio: float = 0.8,
     seed: int = 0,
     shuffle: bool = True,
     stratify_key: Optional[str] = "source_dataset",
-) -> Tuple[List[ModalityMap], List[ModalityMap]]:
+) -> Tuple[List[dict], List[dict]]:
     """
     Deterministic split.
-    If stratify_key is provided, we do a per-group split so train/val preserve group proportions.
-
-    Recommended options:
-      - stratify_key="source_dataset"  (keeps dataset mixture stable)
-      - stratify_key="subsource"       (keeps BraTS2024 GLI/MET/PED mixture stable)
-      - stratify_key=None              (pure random split)
+    stratify_key supports:
+      - "source_dataset" (default; from item["meta"]["source_dataset"])
+      - "subsource"      (from item["meta"]["subsource"])
+      - "meta.case_id"
+      - None for pure random
     """
     if not 0.0 < train_ratio < 1.0:
         raise ValueError("train_ratio must be in (0, 1)")
@@ -171,14 +201,13 @@ def split_train_val(
         n_train = int(train_ratio * len(items))
         return items[:n_train], items[n_train:]
 
-    # group by key
-    buckets: Dict[str, List[ModalityMap]] = {}
+    buckets: Dict[str, List[dict]] = {}
     for it in items:
-        k = str(it.get(stratify_key, "unknown"))
+        k = _get_stratify_value(it, stratify_key)
         buckets.setdefault(k, []).append(it)
 
-    train: List[ModalityMap] = []
-    val: List[ModalityMap] = []
+    train: List[dict] = []
+    val: List[dict] = []
     for _, group in buckets.items():
         group = list(group)
         if shuffle:
@@ -187,7 +216,6 @@ def split_train_val(
         train.extend(group[:n_train])
         val.extend(group[n_train:])
 
-    # final shuffle to mix groups (still deterministic)
     if shuffle:
         rnd.shuffle(train)
         rnd.shuffle(val)
@@ -241,31 +269,33 @@ class BaseDatasetLoader:
                 raise DatasetConfigError(f"[{self.name}] root is not a directory: {r}")
 
     def iter_case_dirs(self) -> List[Tuple[str, str]]:
-        """
-        Return list of (case_dir, subsource_label).
-        subsource_label is useful when merging multiple roots inside one dataset.
-        """
         raise NotImplementedError
 
     def match_modalities(self, case_dir: str) -> Optional[Dict[str, str]]:
-        """Return modality dict or None to skip."""
         raise NotImplementedError
 
-    def _process_one(self, case_dir: str, subsource: str) -> Tuple[bool, Optional[ModalityMap], Optional[str]]:
+    def _process_one(self, case_dir: str, subsource: str) -> Tuple[bool, Optional[dict], Optional[str]]:
         case_id = os.path.basename(case_dir.rstrip("/"))
+
+        # Explicit blacklist
+        if case_id in BLACKLIST_CASE_IDS:
+            return False, None, "blacklisted_case"
+
         try:
             paths = self.match_modalities(case_dir)
             if paths is None:
                 return False, None, "no_match"
 
-            # attach metadata (helps debugging + stratification)
-            paths = dict(paths)
-            paths["case_id"] = case_id
-            paths["source_dataset"] = self.name
-            paths["subsource"] = subsource
-
             _assert_case_integrity(f"{self.name}/{case_id}", paths)
-            return True, paths, None
+
+            # Keep only image keys at top-level; metadata nested under "meta"
+            item = dict(paths)
+            item["meta"] = {
+                "case_id": case_id,
+                "source_dataset": self.name,
+                "subsource": subsource,
+            }
+            return True, item, None
 
         except ModalityIntegrityError as e:
             msg = str(e)
@@ -279,19 +309,11 @@ class BaseDatasetLoader:
         except Exception:
             return False, None, "exception"
 
-    def load(
-        self,
-        strict: bool = False,
-        num_workers: int = 16,
-    ) -> Tuple[List[ModalityMap], LoadReport]:
-        """
-        strict=False: skip bad cases, count reasons
-        strict=True: raise on first error
-        """
+    def load(self, strict: bool = False, num_workers: int = 16) -> Tuple[List[dict], LoadReport]:
         self.validate_roots()
         case_dirs = self.iter_case_dirs()
 
-        data: List[ModalityMap] = []
+        data: List[dict] = []
         skipped_reasons: Dict[str, int] = {}
 
         if num_workers <= 1:
@@ -331,14 +353,6 @@ class BaseDatasetLoader:
 # -----------------------------
 
 class BraTS2021TrainValLoader(BaseDatasetLoader):
-    """
-    BraTS2021 in your real script uses:
-      .../RSNA_ASNR_MICCAI_BraTS2021_TrainingData_16July2021/<case>/*.nii.gz
-      .../RSNA_ASNR_MICCAI_BraTS2021_ValidationData/<case>/*.nii.gz
-
-    tree.txt indicates each case typically has:
-      *_t1.nii.gz, *_t1ce.nii.gz, *_t2.nii.gz, *_flair.nii.gz (+ *_seg.nii.gz)
-    """
     name = "BraTS2021"
 
     def __init__(self, train_root: str = BRATS21_TRAIN_ROOT, val_root: str = BRATS21_VAL_ROOT):
@@ -347,7 +361,7 @@ class BraTS2021TrainValLoader(BaseDatasetLoader):
     def iter_case_dirs(self) -> List[Tuple[str, str]]:
         out: List[Tuple[str, str]] = []
         for r in self.roots:
-            sub = os.path.basename(r.rstrip("/"))  # TrainingData_... or ValidationData
+            sub = os.path.basename(r.rstrip("/"))
             try:
                 dirs = [os.path.join(r, d) for d in sorted(os.listdir(r))]
             except FileNotFoundError:
@@ -356,7 +370,6 @@ class BraTS2021TrainValLoader(BaseDatasetLoader):
         return out
 
     def match_modalities(self, case_dir: str) -> Optional[Dict[str, str]]:
-        # Use explicit suffix matching (robust to file ordering).
         t1n = _pick_first(os.path.join(case_dir, "*_t1.nii.gz"))
         t1c = _pick_first(os.path.join(case_dir, "*_t1ce.nii.gz"))
         t2w = _pick_first(os.path.join(case_dir, "*_t2.nii.gz"))
@@ -367,10 +380,6 @@ class BraTS2021TrainValLoader(BaseDatasetLoader):
 
 
 class EGDLoader(BaseDatasetLoader):
-    """
-    EGD path matches your old script:
-      /mnt/swarm_beta/xuewei/data/EGD/<case>/[1-4]_* /NIFTI/*.nii.gz
-    """
     name = "EGD"
 
     def __init__(self, root: str = EGD_ROOT):
@@ -382,7 +391,6 @@ class EGDLoader(BaseDatasetLoader):
         return [(d, "EGD") for d in dirs if os.path.isdir(d)]
 
     def match_modalities(self, case_dir: str) -> Optional[Dict[str, str]]:
-        # Keep your old glob style, but ensure mapping is by folder number not by sort order.
         t1n = _pick_first(os.path.join(case_dir, "1_T1", "NIFTI", "*.nii.gz"))
         t1c = _pick_first(os.path.join(case_dir, "2_T1GD", "NIFTI", "*.nii.gz"))
         t2w = _pick_first(os.path.join(case_dir, "3_T2", "NIFTI", "*.nii.gz"))
@@ -394,9 +402,7 @@ class EGDLoader(BaseDatasetLoader):
 
 class UPENNGbmLoader(BaseDatasetLoader):
     """
-    UPENN-GBM path matches your old script:
-      /mnt/swarm_beta/xuewei/data/UPENN-GBM/<case>/*.nii.gz
-    tree.txt indicates names like *_T1_unstripped, *_T1GD_unstripped, *_T2_unstripped, *_FLAIR_unstripped.
+    Fix: support .nii.gz AND .nii (some UPENN drops are uncompressed)
     """
     name = "UPENN-GBM"
 
@@ -409,25 +415,29 @@ class UPENNGbmLoader(BaseDatasetLoader):
         return [(d, "UPENN-GBM") for d in dirs if os.path.isdir(d)]
 
     def match_modalities(self, case_dir: str) -> Optional[Dict[str, str]]:
-        # Use suffix matching (more robust than relying on sorted order).
-        t2f = _pick_first(os.path.join(case_dir, "*_FLAIR_unstripped.nii.gz"))
-        t1c = _pick_first(os.path.join(case_dir, "*_T1GD_unstripped.nii.gz"))
-        t1n = _pick_first(os.path.join(case_dir, "*_T1_unstripped.nii.gz"))
-        t2w = _pick_first(os.path.join(case_dir, "*_T2_unstripped.nii.gz"))
+        t1n = _pick_first_any([
+            os.path.join(case_dir, "*_T1_unstripped.nii.gz"),
+            os.path.join(case_dir, "*_T1_unstripped.nii"),
+        ])
+        t1c = _pick_first_any([
+            os.path.join(case_dir, "*_T1GD_unstripped.nii.gz"),
+            os.path.join(case_dir, "*_T1GD_unstripped.nii"),
+        ])
+        t2w = _pick_first_any([
+            os.path.join(case_dir, "*_T2_unstripped.nii.gz"),
+            os.path.join(case_dir, "*_T2_unstripped.nii"),
+        ])
+        t2f = _pick_first_any([
+            os.path.join(case_dir, "*_FLAIR_unstripped.nii.gz"),
+            os.path.join(case_dir, "*_FLAIR_unstripped.nii"),
+        ])
+
         if None in (t1n, t1c, t2w, t2f):
             return None
         return {"t1n": t1n, "t1c": t1c, "t2w": t2w, "t2f": t2f}
 
 
 class UCSFPDGMLoader(BaseDatasetLoader):
-    """
-    UCSF-PDGM:
-    - Your earlier 'better script' assumed *_nifti directories.
-    - Your old local_path.py used /mnt/swarm_beta/xuewei/data/UCSF-PDGM/* (direct case dirs).
-    We support BOTH layouts:
-      - <root>/*_nifti/...
-      - <root>/*/...
-    """
     name = "UCSF-PDGM"
 
     def __init__(self, root: str = UCSF_PDGM_ROOT):
@@ -435,46 +445,23 @@ class UCSFPDGMLoader(BaseDatasetLoader):
 
     def iter_case_dirs(self) -> List[Tuple[str, str]]:
         root = self.roots[0]
-
-        nifti_dirs = sorted(glob.glob(os.path.join(root, "*_nifti")))
-        if nifti_dirs:
-            return [(d, "nifti") for d in nifti_dirs if os.path.isdir(d)]
-
-        # fallback: any subdir that contains nii.gz files
-        out: List[Tuple[str, str]] = []
-        for d in sorted(glob.glob(os.path.join(root, "*"))):
-            if os.path.isdir(d):
-                if glob.glob(os.path.join(d, "*.nii.gz")):
-                    out.append((d, "case_dir"))
-        return out
+        dirs = sorted(glob.glob(os.path.join(root, "*_nifti")))
+        return [(d, "nifti") for d in dirs if os.path.isdir(d)]
 
     def match_modalities(self, case_dir: str) -> Optional[Dict[str, str]]:
         t1n = _pick_first(os.path.join(case_dir, "*_T1_bias.nii.gz"))
-        t2w = _pick_first(os.path.join(case_dir, "*_T2_bias.nii.gz"))
         t1c = _pick_first(os.path.join(case_dir, "*_T1gad_bias.nii.gz"))
+        t2w = _pick_first(os.path.join(case_dir, "*_T2_bias.nii.gz"))
         t2f = _pick_first(os.path.join(case_dir, "*_FLAIR_bias.nii.gz"))
-        if None in (t1n, t2w, t1c, t2f):
+        if None in (t1n, t1c, t2w, t2f):
             return None
         return {"t1n": t1n, "t1c": t1c, "t2w": t2w, "t2f": t2f}
 
 
 class BraTS2024MultiPackLoader(BaseDatasetLoader):
-    """
-    ONE dataset loader that merges BraTS2024-related packs used in your old local_path.py:
-      - GLI: BraTS2024/training_data1 (+ optionally BraTS2024/validation_data)
-      - MET: BraTS24_MET/MICCAI-BraTS2024-MET-Challenge-TrainingData_1
-             BraTS24_MET/MICCAI-BraTS2024-MET-Challenge-TrainingData_2
-             BraTS24_MET/MICCAI-BraTS2024-MET-Challenge-ValidationData
-      - PED: BraTS-PEDs2024_Training/BraTS2024-PED-Challenge-TrainingData
-             BraTS-PEDs2024_Training/BraTS2024-PED-Challenge-ValidationData (if present)
-    """
     name = "BraTS2024"
 
-    def __init__(
-        self,
-        roots: Optional[List[Tuple[str, str]]] = None,
-    ):
-        # roots: list of (path, label). label becomes "subsource".
+    def __init__(self, roots: Optional[List[Tuple[str, str]]] = None):
         if roots is None:
             roots = [
                 (BRATS24_GLI_TRAIN_ROOT, "GLI_train"),
@@ -485,7 +472,6 @@ class BraTS2024MultiPackLoader(BaseDatasetLoader):
                 (BRATS24_PED_TRAIN_ROOT, "PED_train"),
                 (BRATS24_PED_VAL_ROOT, "PED_val"),
             ]
-
         self._root_labels: List[Tuple[str, str]] = [(p, lab) for (p, lab) in roots if p and os.path.isdir(p)]
         super().__init__([p for (p, _) in self._root_labels])
 
@@ -502,14 +488,13 @@ class BraTS2024MultiPackLoader(BaseDatasetLoader):
         return out
 
     def match_modalities(self, case_dir: str) -> Optional[Dict[str, str]]:
-        # Your BraTS2024 packs use "*-t1n.nii.gz" style (per local_path.py).
         t1c = _pick_first(os.path.join(case_dir, "*-t1c.nii.gz"))
         t1n = _pick_first(os.path.join(case_dir, "*-t1n.nii.gz"))
         t2f = _pick_first(os.path.join(case_dir, "*-t2f.nii.gz"))
         t2w = _pick_first(os.path.join(case_dir, "*-t2w.nii.gz"))
 
-        # Fallback if a pack uses classic BraTS naming.
         if None in (t1n, t1c, t2w, t2f):
+            # fallback to classic naming
             t1n = t1n or _pick_first(os.path.join(case_dir, "*_t1.nii.gz"))
             t1c = t1c or _pick_first(os.path.join(case_dir, "*_t1ce.nii.gz"))
             t2w = t2w or _pick_first(os.path.join(case_dir, "*_t2.nii.gz"))
@@ -524,15 +509,15 @@ class BraTS2024MultiPackLoader(BaseDatasetLoader):
 # Harness / entry
 # -----------------------------
 
-def _print_sample(items: List[ModalityMap], k: int = 1) -> None:
+def _print_sample(items: List[dict], k: int = 1) -> None:
     if not items:
         return
     k = min(k, len(items))
     print("  Sample cases:")
     for i in range(k):
         d = items[i]
-        meta = f"case_id={d.get('case_id')} source={d.get('source_dataset')} sub={d.get('subsource')}"
-        print(f"    [{i}] {meta}")
+        meta = d.get("meta", {})
+        print(f"    [{i}] case_id={meta.get('case_id')} source={meta.get('source_dataset')} sub={meta.get('subsource')}")
         for m in REQUIRED_MODALITIES:
             print(f"      {m}: {d[m]}")
 
@@ -543,12 +528,12 @@ def test_load_datasets(
     strict: bool = False,
     stratify_key: Optional[str] = "source_dataset",
     num_workers: int = 16,
-) -> Tuple[List[ModalityMap], List[ModalityMap]]:
+) -> Tuple[List[dict], List[dict]]:
     print("=" * 90)
     print("DATASET LOADING TEST")
     print("=" * 90)
 
-    all_items: List[ModalityMap] = []
+    all_items: List[dict] = []
     for loader in loaders:
         print("-" * 90)
         try:
@@ -560,7 +545,6 @@ def test_load_datasets(
         except Exception as e:
             print(f"[UNEXPECTED ERROR] {loader.name}: {type(e).__name__}: {e}")
 
-    # Deduplicate after merging all datasets (safe + cheap).
     before = len(all_items)
     all_items = _dedupe_by_modalities(all_items)
     after = len(all_items)
@@ -579,10 +563,10 @@ def test_load_datasets(
     print(f"Final split: train={len(train)} val={len(val)} (train_ratio={train_ratio}, seed={seed})")
 
     if stratify_key:
-        def _dist(x: List[ModalityMap]) -> Dict[str, int]:
+        def _dist(x: List[dict]) -> Dict[str, int]:
             d: Dict[str, int] = {}
             for it in x:
-                k = str(it.get(stratify_key, "unknown"))
+                k = _get_stratify_value(it, stratify_key)
                 d[k] = d.get(k, 0) + 1
             return dict(sorted(d.items(), key=lambda kv: -kv[1]))
 
@@ -598,16 +582,15 @@ def get_data_path(
     seed: int = 2026,
     stratify_key: Optional[str] = "source_dataset",
     num_workers: int = 16,
-) -> Tuple[List[ModalityMap], List[ModalityMap]]:
+) -> Tuple[List[dict], List[dict]]:
     """
-    Replacement for your original get_data_path().
     Returns:
       train_items, val_items
-    Each item includes:
-      t1n,t1c,t2w,t2f + case_id, source_dataset, subsource
 
-    NOTE:
-    - If you want to keep BraTS2024 pack proportions stable, use stratify_key="subsource".
+    stratify_key:
+      - "source_dataset" (default)
+      - "subsource" (recommended if you want BraTS2024 GLI/MET/PED mixture stable)
+      - None
     """
     loaders: List[BaseDatasetLoader] = [
         BraTS2021TrainValLoader(),
@@ -615,7 +598,6 @@ def get_data_path(
         EGDLoader(),
         UCSFPDGMLoader(),
         UPENNGbmLoader(),
-        # InhouseLoader()  # add once you confirm the root on this machine
     ]
     return test_load_datasets(
         loaders=loaders,
@@ -628,58 +610,17 @@ def get_data_path(
 
 
 def main():
-    # You can set MRI_DATA_ROOT to override DATA_ROOT:
-    #   export MRI_DATA_ROOT=/path/to/your/data_root
     print(f"DATA_ROOT = {DATA_ROOT}")
-
     train, val = get_data_path(
         train_ratio=0.8,
         seed=2026,
-        stratify_key="source_dataset",   # or "subsource" for BraTS2024 pack-level stratification
-        num_workers=24,                  # bump if your filesystem can handle it
+        stratify_key="source_dataset",
+        num_workers=24,
     )
-
-    # sanity check a few (light)
+    # light sanity check
     for idx, item in enumerate(train[:10]):
         _assert_case_integrity(f"train[{idx}]", item)
-    all_items = train + val
 
-    report = check_nifti_corruption(
-        all_items,
-        max_workers=16,
-        force_full_read=True,   # strongest corruption check
-        check_finite=False,     # turn on if you want NaN/Inf detection
-        sample_slices=None,     # set e.g. 8 if you want a faster “spot check”
-    )
-
-    print("Summary:", {k: report[k] for k in ["total_files","ok_files","failed_files","failure_rate"]})
-    if report["failed_files"] > 0:
-        print("Example failure:", report["failures"][0])
 
 if __name__ == "__main__":
     main()
-
-
-# -----------------------------
-# Optional: augmentation stub (keep outside path loader)
-# -----------------------------
-# If you are using MONAI, you typically define transforms in your training code, e.g.:
-#
-# from monai.transforms import (
-#     Compose, LoadImaged, EnsureChannelFirstd, EnsureTyped,
-#     Orientationd, Spacingd, ScaleIntensityRanged,
-#     RandFlipd, RandAffined, RandGaussianNoised, RandScaleIntensityd,
-# )
-#
-# def get_train_transforms():
-#     return Compose([
-#         LoadImaged(keys=["t1n","t1c","t2w","t2f"]),
-#         EnsureChannelFirstd(keys=["t1n","t1c","t2w","t2f"]),
-#         Orientationd(keys=["t1n","t1c","t2w","t2f"], axcodes="RAS"),
-#         # Spacingd(...)  # only if you want to resample to common spacing
-#         # ScaleIntensityRanged(...) # if consistent intensity mapping makes sense for your data
-#         RandFlipd(keys=["t1n","t1c","t2w","t2f"], prob=0.5, spatial_axis=0),
-#         RandAffined(keys=["t1n","t1c","t2w","t2f"], prob=0.2, rotate_range=(0.1,0.1,0.1)),
-#         RandGaussianNoised(keys=["t1n","t1c","t2w","t2f"], prob=0.15, mean=0.0, std=0.01),
-#         EnsureTyped(keys=["t1n","t1c","t2w","t2f"]),
-#     ])

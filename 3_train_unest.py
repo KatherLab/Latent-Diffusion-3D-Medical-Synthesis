@@ -108,15 +108,6 @@ def main():
     from models.unest.unest import UNEST
 
     model = UNEST(in_channels=2, out_channels=2, spatial_dims=3, img_size=(96, 96, 96), num_layers=4).to(device)
-        dims=3,
-        image_size=96,
-        in_channels=2,
-        model_channels=96,
-        out_channels=2,
-        num_res_blocks=1,
-        attention_resolutions=[32, 16, 8],
-        channel_mult=[1, 2, 2, 2],
-    ).to(device)
 
     if distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
@@ -155,8 +146,8 @@ def main():
         cfg=train_cfg,
         logger=logger,
         optimizer=optimizer,
-s*scheduler=None,
-s*perceptual_loss_fn=None,
+scheduler=None,
+perceptual_loss_fn=None,
     )
 
     cleanup_ddp()

@@ -124,23 +124,11 @@ def define_vae_transform(
     """
     Define the MAISI VAE transform pipeline for training or validation.
 
-    Args:
-        is_train (bool): Whether it's for training or not. If True, the output transform will consider random_aug, the cropping will use "patch_size" for random cropping. If False, the output transform will alwasy treat "random_aug" as False, will use "val_patch_size" for central cropping.
-        modality (str): The imaging modality, either 'ct' or 'mri'.
-        random_aug (bool): Whether to apply random data augmentation.
-        k (int, optional): Patches should be divisible by k. Defaults to 4.
-        patch_size (List[int], optional): Size of the patches. Defaults to [128, 128, 128]. Will random crop patch for training.
-        val_patch_size (Optional[List[int]], optional): Size of validation patches. Defaults to None. If None, will use the whole volume for validation. If given, will central crop a patch for validation.
-        output_dtype (torch.dtype, optional): Output data type. Defaults to torch.float32.
-        spacing_type (str, optional): Type of spacing. Defaults to "original". Choose from ["original", "fixed", "rand_zoom"].
-        spacing (Optional[List[float]], optional): Spacing values. Defaults to None.
-        image_keys (List[str], optional): List of image keys. Defaults to ["image"].
-        label_keys (List[str], optional): List of label keys. Defaults to [].
-        additional_keys (List[str], optional): List of additional keys. Defaults to [].
-        select_channel (int, optional): Channel to select for multi-channel MRI. Defaults to 0.
-
-    Returns:
-        tuple: A tuple containing Composed Transform train_transforms or val_transforms depending on 'is_train'.
+    Notes (project-specific):
+    - We set EnsureTyped(..., track_meta=False) to convert MONAI MetaTensor -> plain torch.Tensor.
+      This avoids rare shape/metadata propagation issues when using pure torch ops inside networks.
+    - We enforce a minimum divisible padding factor in validation (effective_k >= 16) because many 3D UNets
+      downsample 4 times (2^4 = 16). If your UNet downsamples 5 times, you may prefer k=32.
     """
     modality = modality.lower()  # Normalize modality to lowercase
     if modality not in SUPPORT_MODALITIES:
@@ -219,13 +207,16 @@ def define_vae_transform(
             ),
         ]
     else:
+        # Ensure val spatial dims are compatible with deep UNets (avoid 40 vs 39 skip mismatch).
+        effective_k = max(int(k), 16)
         val_crop = (
-            [DivisiblePadd(keys=keys, allow_missing_keys=True, k=k)]
+            [DivisiblePadd(keys=keys, allow_missing_keys=True, k=effective_k)]
             if val_patch_size is None
             else [ResizeWithPadOrCropd(keys=keys, allow_missing_keys=True, spatial_size=val_patch_size)]
         )
 
-    final_transform = [EnsureTyped(keys=keys, dtype=output_dtype, allow_missing_keys=True)]
+    # NOTE: track_meta=False is intentional (see docstring notes above).
+    final_transform = [EnsureTyped(keys=keys, dtype=output_dtype, allow_missing_keys=True, track_meta=False)]
 
     if is_train:
         train_transforms = Compose(
@@ -257,23 +248,11 @@ def define_vae_transform_mri3d(
     """
     Define the MAISI VAE transform pipeline for training or validation.
 
-    Args:
-        is_train (bool): Whether it's for training or not. If True, the output transform will consider random_aug, the cropping will use "patch_size" for random cropping. If False, the output transform will alwasy treat "random_aug" as False, will use "val_patch_size" for central cropping.
-        modality (str): The imaging modality, either 'ct' or 'mri'.
-        random_aug (bool): Whether to apply random data augmentation.
-        k (int, optional): Patches should be divisible by k. Defaults to 4.
-        patch_size (List[int], optional): Size of the patches. Defaults to [128, 128, 128]. Will random crop patch for training.
-        val_patch_size (Optional[List[int]], optional): Size of validation patches. Defaults to None. If None, will use the whole volume for validation. If given, will central crop a patch for validation.
-        output_dtype (torch.dtype, optional): Output data type. Defaults to torch.float32.
-        spacing_type (str, optional): Type of spacing. Defaults to "original". Choose from ["original", "fixed", "rand_zoom"].
-        spacing (Optional[List[float]], optional): Spacing values. Defaults to None.
-        image_keys (List[str], optional): List of image keys. Defaults to ["image"].
-        label_keys (List[str], optional): List of label keys. Defaults to [].
-        additional_keys (List[str], optional): List of additional keys. Defaults to [].
-        select_channel (int, optional): Channel to select for multi-channel MRI. Defaults to 0.
-
-    Returns:
-        tuple: A tuple containing Composed Transform train_transforms or val_transforms depending on 'is_train'.
+    IMPORTANT FIX:
+    - Previously, validation returned Compose(common_transform + final_transform) with NO crop/pad,
+      which can cause UNet skip-connection size mismatch (e.g., 40 vs 39) on odd-sized volumes.
+    - We restore validation padding/cropping using DivisiblePadd (effective_k >= 16 by default).
+    - We set EnsureTyped(track_meta=False) to avoid MetaTensor participating in torch ops.
     """
     modality = modality.lower()  # Normalize modality to lowercase
     if modality not in SUPPORT_MODALITIES:
@@ -294,10 +273,16 @@ def define_vae_transform_mri3d(
         # Orientationd(keys=keys, axcodes="RAS", allow_missing_keys=True),
     ]
 
-    common_transform.append(ScaleIntensityRangePercentilesd(keys=image_keys, 
-                                                            lower=0.0, upper=99.5, 
-                                                            b_min=0.0, b_max=1, 
-                                                            clip=False))
+    common_transform.append(
+        ScaleIntensityRangePercentilesd(
+            keys=image_keys,
+            lower=0.0,
+            upper=99.5,
+            b_min=0.0,
+            b_max=1,
+            clip=False,
+        )
+    )
     # common_transform.append(ScaleIntensityMRI3D(keys=image_keys, lower=0.0, upper=99.5, b_min=0.0, b_max=1, clip=False))
     # common_transform.append(EnsureChannelFirstd(keys=keys, allow_missing_keys=True))
     # common_transform.append(Orientationd(keys=keys, axcodes="RAS", allow_missing_keys=True))
@@ -354,14 +339,17 @@ def define_vae_transform_mri3d(
                 keys=keys, roi_size=patch_size, allow_missing_keys=True, random_size=False, random_center=True
             ),
         ]
-    # else:
-    #     val_crop = (
-    #         [DivisiblePadd(keys=keys, allow_missing_keys=True, k=k)]
-    #         if val_patch_size is None
-    #         else [ResizeWithPadOrCropd(keys=keys, allow_missing_keys=True, spatial_size=val_patch_size)]
-    #     )
+    else:
+        # Validation: either pad to divisible shape (default) or crop/pad to fixed patch size.
+        effective_k = max(int(k), 16)
+        val_crop = (
+            [DivisiblePadd(keys=keys, allow_missing_keys=True, k=effective_k)]
+            if val_patch_size is None
+            else [ResizeWithPadOrCropd(keys=keys, allow_missing_keys=True, spatial_size=val_patch_size)]
+        )
 
-    final_transform = [EnsureTyped(keys=keys, dtype=output_dtype, allow_missing_keys=True)]
+    # NOTE: track_meta=False is intentional.
+    final_transform = [EnsureTyped(keys=keys, dtype=output_dtype, allow_missing_keys=True, track_meta=False)]
 
     if is_train:
         train_transforms = Compose(
@@ -371,8 +359,7 @@ def define_vae_transform_mri3d(
         )
         return train_transforms
     else:
-        # val_transforms = Compose(common_transform + val_crop + final_transform)
-        val_transforms = Compose(common_transform + final_transform)
+        val_transforms = Compose(common_transform + val_crop + final_transform)
         return val_transforms
 
 
@@ -394,23 +381,9 @@ def define_vae_transform2d(
     """
     Define the MAISI VAE transform pipeline for training or validation.
 
-    Args:
-        is_train (bool): Whether it's for training or not. If True, the output transform will consider random_aug, the cropping will use "patch_size" for random cropping. If False, the output transform will alwasy treat "random_aug" as False, will use "val_patch_size" for central cropping.
-        modality (str): The imaging modality, either 'ct' or 'mri'.
-        random_aug (bool): Whether to apply random data augmentation.
-        k (int, optional): Patches should be divisible by k. Defaults to 4.
-        patch_size (List[int], optional): Size of the patches. Defaults to [128, 128, 128]. Will random crop patch for training.
-        val_patch_size (Optional[List[int]], optional): Size of validation patches. Defaults to None. If None, will use the whole volume for validation. If given, will central crop a patch for validation.
-        output_dtype (torch.dtype, optional): Output data type. Defaults to torch.float32.
-        spacing_type (str, optional): Type of spacing. Defaults to "original". Choose from ["original", "fixed", "rand_zoom"].
-        spacing (Optional[List[float]], optional): Spacing values. Defaults to None.
-        image_keys (List[str], optional): List of image keys. Defaults to ["image"].
-        label_keys (List[str], optional): List of label keys. Defaults to [].
-        additional_keys (List[str], optional): List of additional keys. Defaults to [].
-        select_channel (int, optional): Channel to select for multi-channel MRI. Defaults to 0.
-
-    Returns:
-        tuple: A tuple containing Composed Transform train_transforms or val_transforms depending on 'is_train'.
+    Notes:
+    - track_meta=False for EnsureTyped to return plain torch.Tensor.
+    - effective_k >= 16 for divisible padding (if val_patch_size is None).
     """
     modality = modality.lower()  # Normalize modality to lowercase
     if modality not in SUPPORT_MODALITIES:
@@ -489,13 +462,14 @@ def define_vae_transform2d(
             # ),
         ]
     else:
+        effective_k = max(int(k), 16)
         val_crop = (
-            [DivisiblePadd(keys=keys, allow_missing_keys=True, k=k)]
+            [DivisiblePadd(keys=keys, allow_missing_keys=True, k=effective_k)]
             if val_patch_size is None
             else [ResizeWithPadOrCropd(keys=keys, allow_missing_keys=True, spatial_size=val_patch_size)]
         )
 
-    final_transform = [EnsureTyped(keys=keys, dtype=output_dtype, allow_missing_keys=True)]
+    final_transform = [EnsureTyped(keys=keys, dtype=output_dtype, allow_missing_keys=True, track_meta=False)]
 
     if is_train:
         train_transforms = Compose(
@@ -507,7 +481,8 @@ def define_vae_transform2d(
     else:
         val_transforms = Compose(common_transform + val_crop + final_transform)
         return val_transforms
-    
+
+
 class VAE_Transform:
     """
     A class to handle MAISI VAE transformations for different modalities.
@@ -530,20 +505,6 @@ class VAE_Transform:
     ):
         """
         Initialize the VAE_Transform.
-
-        Args:
-            is_train (bool): Whether it's for training or not. If True, the output transform will consider random_aug, the cropping will use "patch_size" for random cropping. If False, the output transform will alwasy treat "random_aug" as False, will use "val_patch_size" for central cropping.
-            random_aug (bool): Whether to apply random data augmentation for training.
-            k (int, optional): Patches should be divisible by k. Defaults to 4.
-            patch_size (List[int], optional): Size of the patches. Defaults to [128, 128, 128]. Will random crop patch for training.
-            val_patch_size (Optional[List[int]], optional): Size of validation patches. Defaults to None. If None, will use the whole volume for validation. If given, will central crop a patch for validation.
-            output_dtype (torch.dtype, optional): Output data type. Defaults to torch.float32.
-            spacing_type (str, optional): Type of spacing. Defaults to "original". Choose from ["original", "fixed", "rand_zoom"].
-            spacing (Optional[List[float]], optional): Spacing values. Defaults to None.
-            image_keys (List[str], optional): List of image keys. Defaults to ["image"].
-            label_keys (List[str], optional): List of label keys. Defaults to [].
-            additional_keys (List[str], optional): List of additional keys. Defaults to [].
-            select_channel (int, optional): Channel to select for multi-channel MRI. Defaults to 0.
         """
         if spacing_type not in ["original", "fixed", "rand_zoom"]:
             raise ValueError(
@@ -573,16 +534,6 @@ class VAE_Transform:
     def __call__(self, img: dict, fixed_modality: Optional[str] = None) -> dict:
         """
         Apply the appropriate transform to the input image.
-
-        Args:
-            img (dict): Input image dictionary.
-            fixed_modality (Optional[str], optional): Fixed modality to use. Defaults to None.
-
-        Returns:
-            Composed Transform
-
-        Raises:
-            ValueError: If the modality is not 'ct' or 'mri'.
         """
         modality = fixed_modality or img["class"]
         modality = modality.lower()  # Normalize modality to lowercase
@@ -593,12 +544,11 @@ class VAE_Transform:
 
         transform = self.transform_dict[modality]
         return transform(img)
-    
 
 
 class VAETransformMRI:
     """
-    A class to handle MAISI VAE transformations for different modalities.
+    A class to handle MAISI VAE transformations for MRI 3D.
     """
 
     def __init__(
@@ -616,23 +566,6 @@ class VAETransformMRI:
         additional_keys: List[str] = [],
         select_channel: int = 0,
     ):
-        """
-        Initialize the VAE_Transform.
-
-        Args:
-            is_train (bool): Whether it's for training or not. If True, the output transform will consider random_aug, the cropping will use "patch_size" for random cropping. If False, the output transform will alwasy treat "random_aug" as False, will use "val_patch_size" for central cropping.
-            random_aug (bool): Whether to apply random data augmentation for training.
-            k (int, optional): Patches should be divisible by k. Defaults to 4.
-            patch_size (List[int], optional): Size of the patches. Defaults to [128, 128, 128]. Will random crop patch for training.
-            val_patch_size (Optional[List[int]], optional): Size of validation patches. Defaults to None. If None, will use the whole volume for validation. If given, will central crop a patch for validation.
-            output_dtype (torch.dtype, optional): Output data type. Defaults to torch.float32.
-            spacing_type (str, optional): Type of spacing. Defaults to "original". Choose from ["original", "fixed", "rand_zoom"].
-            spacing (Optional[List[float]], optional): Spacing values. Defaults to None.
-            image_keys (List[str], optional): List of image keys. Defaults to ["image"].
-            label_keys (List[str], optional): List of label keys. Defaults to [].
-            additional_keys (List[str], optional): List of additional keys. Defaults to [].
-            select_channel (int, optional): Channel to select for multi-channel MRI. Defaults to 0.
-        """
         if spacing_type not in ["original", "fixed", "rand_zoom"]:
             raise ValueError(
                 f"spacing_type has to be chosen from ['original', 'fixed', 'rand_zoom']. Got {spacing_type}."
@@ -657,27 +590,12 @@ class VAETransformMRI:
         )
 
     def __call__(self, img: dict, fixed_modality: Optional[str] = None) -> dict:
-        """
-        Apply the appropriate transform to the input image.
-
-        Args:
-            img (dict): Input image dictionary.
-            fixed_modality (Optional[str], optional): Fixed modality to use. Defaults to None.
-
-        Returns:
-            Composed Transform
-
-        Raises:
-            ValueError: If the modality is not 'ct' or 'mri'.
-        """
-
         return self.transform(img)
-
 
 
 class VAETransformMRI2D:
     """
-    A class to handle MAISI VAE transformations for different modalities.
+    A class to handle MAISI VAE transformations for MRI 2D.
     """
 
     def __init__(
@@ -695,23 +613,6 @@ class VAETransformMRI2D:
         additional_keys: List[str] = [],
         select_channel: int = 0,
     ):
-        """
-        Initialize the VAE_Transform.
-
-        Args:
-            is_train (bool): Whether it's for training or not. If True, the output transform will consider random_aug, the cropping will use "patch_size" for random cropping. If False, the output transform will alwasy treat "random_aug" as False, will use "val_patch_size" for central cropping.
-            random_aug (bool): Whether to apply random data augmentation for training.
-            k (int, optional): Patches should be divisible by k. Defaults to 4.
-            patch_size (List[int], optional): Size of the patches. Defaults to [128, 128, 128]. Will random crop patch for training.
-            val_patch_size (Optional[List[int]], optional): Size of validation patches. Defaults to None. If None, will use the whole volume for validation. If given, will central crop a patch for validation.
-            output_dtype (torch.dtype, optional): Output data type. Defaults to torch.float32.
-            spacing_type (str, optional): Type of spacing. Defaults to "original". Choose from ["original", "fixed", "rand_zoom"].
-            spacing (Optional[List[float]], optional): Spacing values. Defaults to None.
-            image_keys (List[str], optional): List of image keys. Defaults to ["image"].
-            label_keys (List[str], optional): List of label keys. Defaults to [].
-            additional_keys (List[str], optional): List of additional keys. Defaults to [].
-            select_channel (int, optional): Channel to select for multi-channel MRI. Defaults to 0.
-        """
         if spacing_type not in ["original", "fixed", "rand_zoom"]:
             raise ValueError(
                 f"spacing_type has to be chosen from ['original', 'fixed', 'rand_zoom']. Got {spacing_type}."
@@ -736,18 +637,4 @@ class VAETransformMRI2D:
         )
 
     def __call__(self, img: dict, fixed_modality: Optional[str] = None) -> dict:
-        """
-        Apply the appropriate transform to the input image.
-
-        Args:
-            img (dict): Input image dictionary.
-            fixed_modality (Optional[str], optional): Fixed modality to use. Defaults to None.
-
-        Returns:
-            Composed Transform
-
-        Raises:
-            ValueError: If the modality is not 'ct' or 'mri'.
-        """
-
         return self.transform(img)
