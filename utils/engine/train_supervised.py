@@ -272,8 +272,8 @@ def run_training_supervised(
 
         pbar = tqdm(total=len(train_loader), desc=f"Epoch {epoch}", disable=not is_main_process())
         for bi, batch in enumerate(train_loader):
-            if is_main_process() and bi < int(cfg.debug_first_train_batches) and epoch == 0:
-                _debug_batch("[DEBUG TRAIN]", batch, cfg)
+            #if is_main_process() and bi < int(cfg.debug_first_train_batches) and epoch == 0:
+            #    _debug_batch("[DEBUG TRAIN]", batch, cfg)
 
             t1n = _as_plain_tensor(batch["t1n"])
             t2w = _as_plain_tensor(batch["t2w"])
