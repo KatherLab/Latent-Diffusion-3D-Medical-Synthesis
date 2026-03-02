@@ -48,6 +48,7 @@ REQUIRED_MODALITIES = ("t1n", "t1c", "t2w", "t2f")
 # Explicit blacklist for known corrupted cases (exclude whole case)
 BLACKLIST_CASE_IDS = {
     "BraTS-PED-00255-000",  # corrupted t1c: not a gzip file
+    "BraTS-MET-00232-000",  # corrupted gz (zlib invalid stored block lengths)
 }
 
 
