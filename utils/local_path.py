@@ -3,7 +3,7 @@ import glob
 
 
 def get_inhouse_data_path():
-    all_dirs = sorted(glob.glob("/share/project/zhaohuxing/data/inhouse数据/inhouse/number/*/*"))
+    all_dirs = sorted(glob.glob("/share/project/zhaohuxing/data/inhouse/inhouse/number/*/*"))
 
     # print(f"inhouse data is {len(all_dirs)}")
     # exit(0)
@@ -125,16 +125,14 @@ def get_brats24_data():
     path_1_validation_data ='/mnt/swarm_beta/xuewei/data/BraTS2024/validation_data'
     data_dicts_1 = list_brats24_paths(path_1)
 
-    path_2_Training_1 = "/mnt/swarm_beta/xuewei/data/BraTS24_MET/MICCAI-BraTS2024-MET-Challenge-TrainingData_1/MICCAI-BraTS2024-MET-Challenge-Training_1"
-
-    path_2v ='/mnt/swarm_beta/xuewei/data/BraTS24_MET/MICCAI-BraTS2024-MET-Challenge-TrainingData_2'
-    path_2_f ='/mnt/swarm_beta/xuewei/data/BraTS24_MET/MICCAI-BraTS2024-MET-Challenge-TrainingData_2-fixed-cases/MICCAI-BraTS2024-MET-Challenge-TrainingData_2-fixed-cases'
-    path_2_c ='/mnt/swarm_beta/xuewei/data/BraTS24_MET/MICCAI-BraTS2024-MET-Challenge-ValidationData/MICCAI-BraTS2024-MET-Challenge-Validation'
+    path_2_Training_1 = "/mnt/swarm_beta/xuewei/data/BraTS24_MET/MICCAI-BraTS2024-MET-Challenge-TrainingData_1"
+    path_2v ='/mnt/swarm_beta/xuewei/data/BraTS24_MET/MICCAI-BraTS2024-MET-Challenge-TrainingData_2' # applied fixed cases already
+    path_2_c ='/mnt/swarm_beta/xuewei/data/BraTS24_MET/MICCAI-BraTS2024-MET-Challenge-ValidationData'
     data_dicts_2 = list_brats24_paths(path_2)
 
-    path_3 = "/mnt/swarm_beta/xuewei/data/BraTS-PEDs2024_Training/BraTS2024-PED-Challenge-TrainingData/BraTS-PEDs2024_Training"
-    path_3_2     = "/mnt/swarm_beta/xuewei/data/BraTS-PEDs2024_Training/BraTS2024-PED-Challenge-ValidationData/BraTS_Validation_Data_backup"
-
+    path_3 = "/mnt/swarm_beta/xuewei/data/BraTS-PEDs2024_Training/BraTS2024-PED-Challenge-TrainingData"
+    path_3_2     = "/mnt/swarm_beta/xuewei/data/BraTS-PEDs2024_Training/BraTS2024-PED-Challenge-ValidationData"
+    # all the data above should be mixed together then split afterwards
     data_dicts_3 = list_brats24_paths(path_3)
 
     len_train = int(0.8 * len(data_dicts_1))
@@ -155,7 +153,7 @@ def get_brats24_data():
 def get_brats21_data():
     brats21_data_path = "/mnt/swarm_beta/xuewei/data/BraTS2021/RSNA_ASNR_MICCAI_BraTS2021_TrainingData_16July2021"
     brats21_data_path_v = "/mnt/swarm_beta/xuewei/data/BraTS2021/RSNA_ASNR_MICCAI_BraTS2021_ValidationData"
-
+    # all the data above should be mixed together then split afterwards
 
     data_dicts_brats21 = []
 
