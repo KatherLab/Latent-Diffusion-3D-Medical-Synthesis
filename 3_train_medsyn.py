@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Refactored supervised UNet3D trainer (single GPU by default; torchrun optional)."""
+"""
+3_train_medsyn.py (refactored)
+
+MedSyn Unet3D supervised training with shared engine:
+- single GPU by default (no torch.distributed.launch needed)
+- optional DDP via torchrun
+- early stopping, periodic checkpoints, rich TensorBoard logging
+- per-dataset validation metrics (3D + slice-wise 2D)
+
+Smoke test (fast):
+  python 3_train_medsyn.py --config configs/config_medsyn.yaml --max-train-batches 10 --max-val-batches 10
+"""
 
 from __future__ import annotations
 
@@ -9,10 +20,7 @@ import os
 
 import torch
 from omegaconf import OmegaConf
-from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader
-
-from monai.losses.perceptual import PerceptualLoss
 
 from utils.engine.collate import dict_collate
 from utils.engine.ddp import setup_ddp_from_env, cleanup_ddp, is_main_process
@@ -21,26 +29,48 @@ from utils.engine.train_supervised import TrainConfig, run_training_supervised
 from utils.brain_data_utils import get_dataset
 
 
-def build_scheduler(optimizer, max_epochs: int, power: float = 0.9):
-    def poly_rule(epoch: int) -> float:
-        return (1.0 - (epoch / float(max_epochs))) ** power
-    return lr_scheduler.LambdaLR(optimizer, lr_lambda=poly_rule)
-
-
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=str, default="configs/config_medsyn.yaml")
+
+    # dataloader / speed
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--prefetch-factor", type=int, default=2)
+
+    # logging / ckpt / early stop
     p.add_argument("--log-every-steps", type=int, default=50)
     p.add_argument("--save-every-epochs", type=int, default=5)
     p.add_argument("--early-patience", type=int, default=30)
     p.add_argument("--early-min-delta", type=float, default=0.0)
-    p.add_argument("--perceptual-weight", type=float, default=0.3)
+
+    # metrics
     p.add_argument("--data-range", type=float, default=1.0)
     p.add_argument("--slice-stride", type=int, default=2)
     p.add_argument("--slice-max-slices", type=int, default=0)
+
+    # smoke test (limits batches per epoch; does NOT change dataset size)
+    p.add_argument("--max-train-batches", type=int, default=0)
+    p.add_argument("--max-val-batches", type=int, default=0)
+
     return p.parse_args()
+
+
+class _LimitedLoader:
+    """Cap the number of batches yielded from an existing DataLoader (fast smoke tests)."""
+    def __init__(self, loader, max_batches: int):
+        self.loader = loader
+        self.max_batches = int(max_batches)
+
+    def __len__(self):
+        if self.max_batches and self.max_batches > 0:
+            return min(len(self.loader), self.max_batches)
+        return len(self.loader)
+
+    def __iter__(self):
+        for i, batch in enumerate(self.loader):
+            if self.max_batches and self.max_batches > 0 and i >= self.max_batches:
+                break
+            yield batch
 
 
 def main():
@@ -78,21 +108,16 @@ def main():
         collate_fn=dict_collate,
     )
 
-    from models.medsyn.train_low_res import Unet3D
+    # Optional: cap batches for fast smoke tests
+    if args.max_train_batches and args.max_train_batches > 0:
+        train_loader = _LimitedLoader(train_loader, args.max_train_batches)
+    if args.max_val_batches and args.max_val_batches > 0:
+        val_loader = _LimitedLoader(val_loader, args.max_val_batches)
 
+    # FIX: correct MedSyn model instantiation
+    from models.medsyn.train_low_res import Unet3D
     model = Unet3D(dim=16, channels=2).to(device)
-    '''       
-    (
-        dims=3,
-        image_size=96,
-        in_channels=2,
-        model_channels=96,
-        out_channels=2,
-        num_res_blocks=1,
-        attention_resolutions=[32, 16, 8],
-        channel_mult=[1, 2, 2, 2],
-    ).to(device))
-    '''
+
     if distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
 
@@ -109,6 +134,7 @@ def main():
         log_every_steps=int(args.log_every_steps),
         save_every_epochs=int(args.save_every_epochs),
         val_every_epochs=1,
+        max_val_batches=int(args.max_val_batches),
         data_range=float(args.data_range),
         perceptual_weight=0.0,
         slice_stride=int(args.slice_stride),

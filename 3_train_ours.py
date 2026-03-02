@@ -40,8 +40,28 @@ def parse_args():
     p.add_argument("--data-range", type=float, default=1.0)
     p.add_argument("--slice-stride", type=int, default=2)
     p.add_argument("--slice-max-slices", type=int, default=0)
+    p.add_argument("--max-train-batches", type=int, default=0, help="If >0, only run this many train batches per epoch")
+    p.add_argument("--max-val-batches", type=int, default=0, help="If >0, only run this many val batches per epoch")
     return p.parse_args()
 
+
+
+class _LimitedLoader:
+    """Cap the number of batches yielded from an existing DataLoader (fast smoke tests)."""
+    def __init__(self, loader, max_batches: int):
+        self.loader = loader
+        self.max_batches = int(max_batches)
+
+    def __len__(self):
+        if self.max_batches and self.max_batches > 0:
+            return min(len(self.loader), self.max_batches)
+        return len(self.loader)
+
+    def __iter__(self):
+        for i, batch in enumerate(self.loader):
+            if self.max_batches and self.max_batches > 0 and i >= self.max_batches:
+                break
+            yield batch
 
 def main():
     args = parse_args()
@@ -78,6 +98,13 @@ def main():
         collate_fn=dict_collate,
     )
 
+    # Optional: cap batches for fast smoke tests
+    if args.max_train_batches and args.max_train_batches > 0:
+        train_loader = _LimitedLoader(train_loader, args.max_train_batches)
+    if args.max_val_batches and args.max_val_batches > 0:
+        val_loader = _LimitedLoader(val_loader, args.max_val_batches)
+
+
     from guided_diffusion.unet_raw_3d import UNetModel
 
     model = UNetModel(
@@ -112,6 +139,7 @@ def main():
         log_every_steps=int(args.log_every_steps),
         save_every_epochs=int(args.save_every_epochs),
         val_every_epochs=1,
+        max_val_batches=int(args.max_val_batches),
         data_range=float(args.data_range),
         perceptual_weight=float(args.perceptual_weight),
         slice_stride=int(args.slice_stride),
