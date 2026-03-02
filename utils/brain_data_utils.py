@@ -28,7 +28,23 @@ class MultiModalDataset(Dataset):
         self.transform = transform
 
     def __getitem__(self, index):
-        return self.transform(self.data[index])
+        item = self.data[index]
+        try:
+            return self.transform(item)
+        except Exception as e:
+            # Print the exact offending files
+            msg = (
+                f"[DATA ERROR] index={index}\n"
+                f"  case_id={item.get('case_id', 'NA')}\n"
+                f"  source_dataset={item.get('source_dataset', 'NA')}\n"
+                f"  subsource={item.get('subsource', 'NA')}\n"
+                f"  t1n={item.get('t1n')}\n"
+                f"  t1c={item.get('t1c')}\n"
+                f"  t2w={item.get('t2w')}\n"
+                f"  t2f={item.get('t2f')}\n"
+            )
+            print(msg, flush=True)
+            raise RuntimeError(msg) from e
 
     def __len__(self) -> int:
         return len(self.data)
