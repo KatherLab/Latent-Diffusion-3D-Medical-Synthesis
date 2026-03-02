@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Refactored supervised UNet3D trainer (single GPU by default; torchrun optional)."""
+"""Refactored RCG trainer using shared supervised engine; requires --rdm-ckpt."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import os
 
 import torch
 from omegaconf import OmegaConf
-from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader
 
 from monai.losses.perceptual import PerceptualLoss
@@ -20,16 +19,17 @@ from utils.engine.logger import make_logger
 from utils.engine.train_supervised import TrainConfig, run_training_supervised
 from utils.brain_data_utils import get_dataset
 
-
-def build_scheduler(optimizer, max_epochs: int, power: float = 0.9):
-    def poly_rule(epoch: int) -> float:
-        return (1.0 - (epoch / float(max_epochs))) ** power
-    return lr_scheduler.LambdaLR(optimizer, lr_lambda=poly_rule)
+from rcg.rdm.util import instantiate_from_config
+from rcg.rdm.models.diffusion.ddim import DDIMSampler
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=str, default="configs/config_unet3d_rcg.yaml")
+    p.add_argument("--rdm-config", type=str, default="config/rdm/rdm_model.yaml")
+    p.add_argument("--rdm-ckpt", type=str, required=True)
+    p.add_argument("--ddim-steps", type=int, default=10)
+    p.add_argument("--eta", type=float, default=1.0)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--prefetch-factor", type=int, default=2)
     p.add_argument("--log-every-steps", type=int, default=50)
@@ -43,6 +43,18 @@ def parse_args():
     return p.parse_args()
 
 
+def load_state_dict_fuzzy(model, weight_path: str, strict: bool = True):
+    sd = torch.load(weight_path, map_location="cpu")
+    if isinstance(sd, dict) and "module" in sd:
+        sd = sd["module"]
+    new_sd = {}
+    for k, v in sd.items():
+        k = str(k)
+        new_sd[k[7:] if k.startswith("module.") else k] = v
+    model.load_state_dict(new_sd, strict=strict)
+    return model
+
+
 def main():
     args = parse_args()
     cfg = OmegaConf.load(args.config)
@@ -50,7 +62,7 @@ def main():
     distributed, local_rank = setup_ddp_from_env()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
-    logger = make_logger(str(cfg.logdir), name="train_vanilla_diff") if is_main_process() else None
+    logger = make_logger(str(cfg.logdir), name="train_rcg") if is_main_process() else None
 
     dataset_train, dataset_val = get_dataset(cfg)
 
@@ -78,9 +90,9 @@ def main():
         collate_fn=dict_collate,
     )
 
-    from models.vanilla_diffusion.model import DiffUNet
+    from guided_diffusion.unet_rdm import UNetModel
 
-    model = DiffUNet().to(device)
+    model = UNetModel(
         dims=3,
         image_size=96,
         in_channels=2,
@@ -91,10 +103,21 @@ def main():
         channel_mult=[1, 2, 2, 2],
     ).to(device)
 
+    # RDM model + sampler
+    rdm_cfg = OmegaConf.load(args.rdm_config)
+    rdm = instantiate_from_config(rdm_cfg.model).to(device)
+    rdm = load_state_dict_fuzzy(rdm, args.rdm_ckpt, strict=True)
+    rdm.eval()
+    sampler = DDIMSampler(model=rdm)
+
     if distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.lr), eps=1e-6)
+
+    perceptual = PerceptualLoss(
+        spatial_dims=3, network_type="squeeze", is_fake_3d=True, fake_3d_ratio=0.2
+    ).eval().to(device)
 
     train_cfg = TrainConfig(
         max_epochs=int(cfg.n_epochs),
@@ -108,7 +131,7 @@ def main():
         save_every_epochs=int(args.save_every_epochs),
         val_every_epochs=1,
         data_range=float(args.data_range),
-        perceptual_weight=0.0,
+        perceptual_weight=float(args.perceptual_weight),
         slice_stride=int(args.slice_stride),
         slice_max_slices=int(args.slice_max_slices),
         early_patience=int(args.early_patience),
@@ -116,10 +139,17 @@ def main():
     )
 
     def forward_fn(images, batch):
-        labels = torch.cat([batch["t1c"], batch["t2f"]], dim=1).to(images.device, non_blocking=True)
-        x_t, time, _noise = model(labels, pred_type="q_sample")
-        pred_xstart = model(x=x_t, step=time, image=images, pred_type="denoise")
-        return pred_xstart
+        with torch.no_grad():
+            rep, _ = sampler.sample(
+                S=int(args.ddim_steps),
+                conditioning=images,
+                batch_size=images.shape[0],
+                shape=(192, 1, 1),
+                eta=float(args.eta),
+                verbose=False,
+            )
+            rdm_rep = rep[:, :, 0, 0]
+        return model(images, rdm_rep)
 
     run_training_supervised(
         model=model,
@@ -130,8 +160,8 @@ def main():
         cfg=train_cfg,
         logger=logger,
         optimizer=optimizer,
-s*scheduler=None,
-s*perceptual_loss_fn=None,
+        scheduler=None,
+        perceptual_loss_fn=perceptual,
     )
 
     cleanup_ddp()

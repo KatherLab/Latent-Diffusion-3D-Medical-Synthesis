@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from .try_read_all_nifty import check_nifti_corruption
 
 # -----------------------------
 # Common types / constants
@@ -641,7 +642,19 @@ def main():
     # sanity check a few (light)
     for idx, item in enumerate(train[:10]):
         _assert_case_integrity(f"train[{idx}]", item)
+    all_items = train + val
 
+    report = check_nifti_corruption(
+        all_items,
+        max_workers=16,
+        force_full_read=True,   # strongest corruption check
+        check_finite=False,     # turn on if you want NaN/Inf detection
+        sample_slices=None,     # set e.g. 8 if you want a faster “spot check”
+    )
+
+    print("Summary:", {k: report[k] for k in ["total_files","ok_files","failed_files","failure_rate"]})
+    if report["failed_files"] > 0:
+        print("Example failure:", report["failures"][0])
 
 if __name__ == "__main__":
     main()
