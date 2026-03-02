@@ -65,7 +65,8 @@ def define_fixed_intensity_transform(modality: str, image_keys: List[str] = ["im
 
     intensity_transforms = {
         "mri": [
-            ScaleIntensityRangePercentilesd(keys=image_keys, lower=0.0, upper=99.5, b_min=0.0, b_max=1, clip=False)
+            Lambdad(keys=image_keys, func=lambda x: x.contiguous()),
+            ScaleIntensityRangePercentilesd(keys=image_keys, lower=0.0, upper=99.5, b_min=0.0, b_max=1, clip=False),
         ],
         "ct": [ScaleIntensityRanged(keys=image_keys, a_min=-1000, a_max=1000, b_min=0.0, b_max=1.0, clip=True)],
     }
@@ -272,7 +273,7 @@ def define_vae_transform_mri3d(
         EnsureChannelFirstd(keys=keys, allow_missing_keys=True),
         # Orientationd(keys=keys, axcodes="RAS", allow_missing_keys=True),
     ]
-
+    common_transform.append(Lambdad(keys=image_keys, func=lambda x: x.contiguous()))
     common_transform.append(
         ScaleIntensityRangePercentilesd(
             keys=image_keys,
