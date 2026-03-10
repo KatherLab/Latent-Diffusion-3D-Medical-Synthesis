@@ -43,7 +43,14 @@ def ssim2d(
         raise ValueError(f"Expected [N,1,H,W], got {x.shape} and {y.shape}")
     if x.shape != y.shape:
         raise ValueError(f"x/y shape mismatch: {x.shape} vs {y.shape}")
+    # Force same dtype/device for SSIM convs (avoid AMP fp16/fp32 mismatch)
+    if hasattr(x, "as_tensor"):
+        x = x.as_tensor()
+    if hasattr(y, "as_tensor"):
+        y = y.as_tensor()
 
+    x = x.float()
+    y = y.float()
     device, dtype = x.device, x.dtype
     k = _gaussian_kernel2d(window_size, sigma, device=device, dtype=dtype)
     k = k.view(1, 1, window_size, window_size)
