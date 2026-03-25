@@ -1,0 +1,7 @@
+case_id: unknown
+source_dataset: unknown
+subsource: unknown
+bi: 19
+images_shape: (1, 2, 96, 96, 96)
+labels_shape: (1, 2, 96, 96, 96)
+pred_shape: (1, 2, 96, 96, 96)
