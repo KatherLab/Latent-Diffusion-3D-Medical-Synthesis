@@ -91,6 +91,12 @@ python 4_inference_unest.py --config configs/config_unest.yaml --ckpt /path/to/c
 python 4_inference_medsyn.py --config configs/config_medsyn.yaml --ckpt /path/to/ckpt_best.pt
 python 4_inference_i2imamba.py --config configs/config_i2imamba.yaml --ckpt /path/to/ckpt_best.pt
 python 4_inference_cyclegan.py --config configs/config_cyclegan.yaml --ckpt /path/to/ckpt_best.pt
+python 4_inference_medsyn_updated.py \
+  --config configs/config_medsyn.yaml \
+  --ckpt logs/medsyn_ep200_noaug/checkpoints/ckpt_best.pt \
+  --save-dir ./predictions_dump \
+  --save-limit 20 \
+  --save-every 1
 ```
 
 ### NIfTI integrity scan (corruption check)
